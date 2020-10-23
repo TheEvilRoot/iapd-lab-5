@@ -1,6 +1,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <functional>
+#include <atomic>
 
 #include <Windows.h>
 #include <dbt.h>
@@ -39,10 +40,50 @@ struct Context {
   HANDLE stdInput;
 };
 
+struct Notification {
+  HANDLE volume;
+  HANDLE notification;
+  char letter;
+
+  bool operator==(const Notification& n) const {
+    return n.volume == volume && n.notification == notification & n.letter == letter;
+  }
+};
+
 DefaultMap<UINT, std::function<long(HWND, UINT, WPARAM, LPARAM)>> messageHandlers([](auto hwnd, auto uMsg, auto wParam, auto lParam) -> long { 
-  std::cout << "DefaultHandler :: Message 0x" << std::hex << uMsg << "\n";
+  //std::cout << "DefaultHandler :: Message 0x" << std::hex << uMsg << "\n";
   return DefWindowProc(hwnd, uMsg, wParam, lParam);
 });
+
+std::atomic<bool> allowMessageEvents{ true };
+std::atomic<Key> lastKey;
+HANDLE readyEvent;
+std::vector<Notification> events;
+
+Key readConsole(HANDLE stdInput) {
+  INPUT_RECORD rec{};
+  DWORD count{ 0 };
+  while (true) {
+    ReadConsoleInputA(stdInput, &rec, 1, &count);
+    if (rec.EventType == KEY_EVENT) {
+      auto& keyEvent = (KEY_EVENT_RECORD&)rec.Event;
+      if (keyEvent.bKeyDown) {
+        Key key{ keyEvent.uChar.AsciiChar, keyEvent.wVirtualKeyCode, keyEvent.wVirtualScanCode };
+        lastKey = key;
+        SetEvent(readyEvent);
+        return key;
+      }
+    }
+  }
+  throw 0;
+}
+
+Key readConsoleThreadSafe(HANDLE stdInput) {
+  ResetEvent(readyEvent);
+  WaitForSingleObject(readyEvent, INFINITE);
+
+  return lastKey.load();
+}
 
 auto unmaskVolumeLetters(DWORD mask) {
   std::string ret;
@@ -54,7 +95,63 @@ auto unmaskVolumeLetters(DWORD mask) {
   return ret;
 }
 
-void handleDeviceArrivalOrRemoval(std::string arrivalOrRemoval, LPARAM lParam) {
+auto letterByVolumeHandle(HANDLE handle) {
+  for (const auto &n : events) {
+    if (n.volume == handle) {
+      return n.letter;
+    }
+  }
+  return '\0';
+}
+
+auto unregisterVolumeNotifications(HANDLE handle) {
+  for (const auto &n : events) {
+    if (n.volume == handle) {
+      CloseHandle(n.volume);
+      UnregisterDeviceNotification(n.notification);
+      events.erase(std::find(events.begin(), events.end(), n));
+      break;
+    }
+  }
+}
+
+auto unregisterVolumeNotifications(char letter) {
+  for (const auto &n : events) {
+    if (n.letter == letter) {
+      CloseHandle(n.volume);
+      UnregisterDeviceNotification(n.notification);
+      events.erase(std::find(events.begin(), events.end(), n));
+      break;
+    }
+  }
+}
+
+auto registerVolumeNotification(HWND window, HANDLE handle, char letter) {
+  DEV_BROADCAST_HANDLE broadcast{};
+  broadcast.dbch_size = sizeof(DEV_BROADCAST_HANDLE);
+  broadcast.dbch_devicetype = DBT_DEVTYP_HANDLE;
+  broadcast.dbch_handle = handle;
+  events.push_back({ handle, RegisterDeviceNotification(window, &broadcast, 0), letter });
+}
+
+auto registerVolumeNotification(HWND window, char letter) {
+  auto path = std::string("\\\\.\\") + std::string(1, letter) + std::string(":");
+  auto handle = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    std::cerr << "Failed to open volume " << path << " :: " << GetLastError() << "\n";
+    return;
+  }
+  registerVolumeNotification(window, handle, letter);
+}
+
+auto registerVolumesEvents(HWND window) {
+  std::vector<Notification> events;
+  for (auto letter : unmaskVolumeLetters(GetLogicalDrives())) {
+    registerVolumeNotification(window, letter);
+  }
+}
+
+void handleDeviceArrivalOrRemoval(HWND window, std::string arrivalOrRemoval, LPARAM lParam) {
   DEV_BROADCAST_HDR* data = (DEV_BROADCAST_HDR*)lParam;
   if (data->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE) {
     DEV_BROADCAST_DEVICEINTERFACE_A* device = (DEV_BROADCAST_DEVICEINTERFACE_A*)lParam;
@@ -78,8 +175,14 @@ void handleDeviceArrivalOrRemoval(std::string arrivalOrRemoval, LPARAM lParam) {
     if (letters.empty()) {
       std::cout << arrivalOrRemoval << "No volumes were mounted";
     } else {
-      for (char letter : letters)
+      for (char letter : letters) {
         std::cout << std::string(1, letter) << " ";
+        if (arrivalOrRemoval == "Removed") {
+          unregisterVolumeNotifications(letter);
+        } else {
+          registerVolumeNotification(window, letter);
+        }
+      }
     }
     std::cout << "\n";
   }
@@ -89,14 +192,47 @@ void handleDeviceArrivalOrRemoval(std::string arrivalOrRemoval, LPARAM lParam) {
   }
 }
 
+long handleQueryRemove(LPARAM param) {
+  if (!allowMessageEvents) return BROADCAST_QUERY_DENY;
+
+  auto* data = (DEV_BROADCAST_HDR*)param;
+  auto* handleDevice = (DEV_BROADCAST_HANDLE*)param;
+  auto letter = letterByVolumeHandle(handleDevice->dbch_handle);
+
+  std::cout << "Safe device removal request has arrived\n";
+  std::cout << "Allow to remove device " << std::string(1, letter) << ":?\n";
+  std::cout << "Use ENTER to allow, BACKSPACE to deny\n";
+
+  auto answer = readConsoleThreadSafe(GetStdHandle(STD_INPUT_HANDLE));
+  if (answer.key == 0xd && answer.scan == 0x1c) {
+    unregisterVolumeNotifications(handleDevice->dbch_handle);
+    std::cout << "Device remove is allowed\n";
+    return TRUE;
+  }
+  if (answer.scan == 0x0e && answer.key == 0x08) {
+    std::cout << "Device remove is denied\n";
+    return BROADCAST_QUERY_DENY;
+  }
+}
+
+void handleDeviceRemovalFailed(LPARAM lParam) {
+  std::cout << "Device failed to remove!\n";
+  DEV_BROADCAST_HDR* data = (DEV_BROADCAST_HDR*)lParam;
+  std::cout << "Type " << data->dbch_devicetype << "\n";
+}
+
 void initMessageHandlers() {
   messageHandlers.set(0x219, [](auto hwnd, auto uMsg, auto wParam, auto lParam) -> long {
-    //std::cout << "Device changed event: 0x" << std::hex << wParam << "\n";
+   // std::cout << "Device changed event: 0x" << std::hex << wParam << "\n";
 
     if (wParam == 0x8004) 
-      handleDeviceArrivalOrRemoval("Removed", lParam);
+      handleDeviceArrivalOrRemoval(hwnd, "Removed", lParam);
     if (wParam == 0x8000)
-      handleDeviceArrivalOrRemoval("Connected", lParam);
+      handleDeviceArrivalOrRemoval(hwnd, "Connected", lParam);
+    if (wParam == 0x8001)
+      return handleQueryRemove(lParam);
+    if (wParam == 0x8002)
+      handleDeviceRemovalFailed(lParam);
 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
   });
@@ -114,31 +250,45 @@ long __stdcall windowHandler(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
   return messageHandlers[uMsg](hwnd, uMsg, wParam, lParam);
 }
 
-Key readConsole(HANDLE stdInput) {
-  INPUT_RECORD rec{};
-  DWORD count{ 0 };
+int readInt(HANDLE stdInput) {
+  int value = 0;
   while (true) {
-    ReadConsoleInputA(stdInput, &rec, 1, &count);
-    if (rec.EventType == KEY_EVENT) {
-      auto& keyEvent = (KEY_EVENT_RECORD&)rec.Event;
-      if (keyEvent.bKeyDown) {
-        return Key{ keyEvent.uChar.AsciiChar, keyEvent.wVirtualKeyCode, keyEvent.wVirtualScanCode };
+    auto k = readConsole(stdInput);
+    if (k.key == 0xd && k.scan == 0x1c) {
+      std::cout << "\n";
+      return value;
+    }
+    if (k.ascii >= '0' && k.ascii <= '9') {
+      value *= 10;
+      value += k.ascii - '0';
+      std::cout << std::string(1, k.ascii);
+      if (value < 0) {
+        std::cout << "\n";
+        return -1;
       }
     }
   }
-  throw 0;
 }
 
 DWORD __stdcall consoleThreadHandler(LPVOID param) {
   auto context = *(Context*)param;
   while (true) {
     auto key = readConsole(context.stdInput);
-    if (key.scan == 0x01 && key.key == 0x1b) {
+    if (key.scan == 0x01 && key.key == 0x1b) { // ESC
       SendMessage(context.window, WM_CLOSE, 0, 0);
       return 0;
     }
-    if (key.scan == 0x3b && key.key == 0x70) {
-
+    if (key.scan == 0x3b && key.key == 0x70) { // F1
+      allowMessageEvents = false;
+      std::cout << "List of volumes to remove: \n";
+      for (int i = 0; i < events.size(); i++) {
+        std::cout << "[" << i << "]" << "Device with volume " << events[i].letter << ": \n";
+      }
+      int value = 0;
+      while ((value = readInt(context.stdInput)) < 0 || value >= events.size()) {
+        std::cout << "Error: OutOfBound\n";
+      }
+      allowMessageEvents = true;
     }
   }
   return 0;
@@ -150,21 +300,6 @@ void printPrompt() {
   std::cout << "There's some hot keys to with with ...that thingy...:\n";
   std::cout << "\tUse ESC to exit the program\n";
   std::cout << "\tUse F1 to request safe ejection for usb device\n";
-}
-
-auto registerVolumesEvents(HWND window) {
-  std::vector<HANDLE> events;
-  auto prefix = std::string("\\\\.\\");
-  for (auto letter : unmaskVolumeLetters(GetLogicalDrives())) {
-    auto path = prefix + std::string(1, letter) + std::string(":\\");
-    auto handle = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    DEV_BROADCAST_HANDLE broadcast{};
-    broadcast.dbch_size = sizeof(DEV_BROADCAST_HANDLE);
-    broadcast.dbch_devicetype = DBT_DEVTYP_HANDLE;
-    broadcast.dbch_handle = handle;
-    events.push_back(RegisterDeviceNotification(window, &broadcast, 0));
-  }
-  return events;
 }
 
 int main() {
@@ -200,6 +335,8 @@ int main() {
   printPrompt();
   initMessageHandlers();
   UpdateWindow(window);
+
+  readyEvent = CreateEventA(nullptr, true, false, nullptr);
 
   Context context{ window, stdInput };
   auto consoleThread = CreateThread(nullptr, 0, &consoleThreadHandler, &context, 0, nullptr);
