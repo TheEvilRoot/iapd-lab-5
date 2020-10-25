@@ -1,10 +1,15 @@
+#pragma comment (lib, "setupapi.lib")
+
 #include <iostream>
 #include <unordered_map>
 #include <functional>
 #include <atomic>
+#include <string>
 
 #include <Windows.h>
 #include <dbt.h>
+#include <cfgmgr32.h>
+#include <SetupAPI.h>
 
 EXTERN_C const GUID DECLSPEC_SELECTANY GUID_DEVINTERFACE_USB_DEVICE = { 0xA5DCBF10L, 0x6530, 0x11D2, { 0x90, 0x1F,  0x00,  0xC0,  0x4F,  0xB9,  0x51,  0xED } };
 
@@ -46,7 +51,7 @@ struct Notification {
   char letter;
 
   bool operator==(const Notification& n) const {
-    return n.volume == volume && n.notification == notification & n.letter == letter;
+    return (n.volume == volume) && (n.notification == notification) && (n.letter == letter);
   }
 };
 
@@ -59,6 +64,19 @@ std::atomic<bool> allowMessageEvents{ true };
 std::atomic<Key> lastKey;
 HANDLE readyEvent;
 std::vector<Notification> events;
+
+std::string localizeVeto(PNP_VETO_TYPE veto) {
+  switch (veto) {
+  case PNP_VetoLegacyDevice:  return "Legacy device";
+  case PNP_VetoDevice:  return "Device has rejected request";
+  case PNP_VetoPendingClose: return "Pending close";
+  case PNP_VetoWindowsApp: return "Used by system";
+  case PNP_VetoWindowsService: return "Used by service";
+  case PNP_VetoOutstandingOpen:  return "Used in another program";
+  case PNP_VetoAlreadyRemoved: return "Already removed";
+  default: return "Unknown";
+  }
+}
 
 Key readConsole(HANDLE stdInput) {
   INPUT_RECORD rec{};
@@ -138,10 +156,20 @@ auto registerVolumeNotification(HWND window, char letter) {
   auto path = std::string("\\\\.\\") + std::string(1, letter) + std::string(":");
   auto handle = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
-    std::cerr << "Failed to open volume " << path << " :: " << GetLastError() << "\n";
+    if (GetLastError() != ERROR_ACCESS_DENIED) {
+      std::cerr << "Failed to open volume " << path << " :: " << GetLastError() << "\n";
+    }
     return;
   }
   registerVolumeNotification(window, handle, letter);
+}
+
+void unregisterAllVolumeNotifications() {
+  for (const auto& n : events) {
+    CloseHandle(n.volume);
+    UnregisterDeviceNotification(n.notification);
+  }
+  events.clear();
 }
 
 auto registerVolumesEvents(HWND window) {
@@ -157,9 +185,9 @@ void handleDeviceArrivalOrRemoval(HWND window, std::string arrivalOrRemoval, LPA
     DEV_BROADCAST_DEVICEINTERFACE_A* device = (DEV_BROADCAST_DEVICEINTERFACE_A*)lParam;
     auto name = std::string(device->dbcc_name);
     if (name.size() <= 1) {
-      std::cout << arrivalOrRemoval << " HID device\n";
+      std::cout << arrivalOrRemoval << " USB device\n";
     } else {
-      std::cout << arrivalOrRemoval << " HID device : " << "\n";
+      std::cout << arrivalOrRemoval << " USB device : " << "\n";
     }
   }
   if (data->dbch_devicetype == DBT_DEVTYP_VOLUME) {
@@ -193,7 +221,7 @@ void handleDeviceArrivalOrRemoval(HWND window, std::string arrivalOrRemoval, LPA
 }
 
 long handleQueryRemove(LPARAM param) {
-  if (!allowMessageEvents) return BROADCAST_QUERY_DENY;
+  if (!allowMessageEvents) return TRUE;
 
   auto* data = (DEV_BROADCAST_HDR*)param;
   auto* handleDevice = (DEV_BROADCAST_HANDLE*)param;
@@ -217,8 +245,6 @@ long handleQueryRemove(LPARAM param) {
 
 void handleDeviceRemovalFailed(LPARAM lParam) {
   std::cout << "Device failed to remove!\n";
-  DEV_BROADCAST_HDR* data = (DEV_BROADCAST_HDR*)lParam;
-  std::cout << "Type " << data->dbch_devicetype << "\n";
 }
 
 void initMessageHandlers() {
@@ -252,22 +278,141 @@ long __stdcall windowHandler(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 int readInt(HANDLE stdInput) {
   int value = 0;
-  while (true) {
-    auto k = readConsole(stdInput);
-    if (k.key == 0xd && k.scan == 0x1c) {
-      std::cout << "\n";
-      return value;
+  std::string buffer;
+  std::getline(std::cin, buffer);
+  try {
+    return std::stoi(buffer);
+  } catch (...) {
+    return -1;
+  }
+}
+
+GUID * guidByDeviceType(UINT type, bool isFloppy) {
+  switch (type) {
+  case DRIVE_REMOVABLE: return isFloppy ? ((GUID*)&GUID_DEVINTERFACE_FLOPPY) : ((GUID*)&GUID_DEVINTERFACE_DISK);
+  case DRIVE_FIXED: return (GUID*)&GUID_DEVINTERFACE_DISK;
+  case DRIVE_CDROM: return (GUID*)&GUID_DEVINTERFACE_CDROM;
+  default: return nullptr;
+  }
+}
+
+DEVINST getDeviceInstance(DWORD deviceNumber, UINT deviceType, const std::string& dosDeviceName) {
+  bool isFloppy = (dosDeviceName.size() >= 7 && dosDeviceName.substr(0, 7) == "\\Floppy");
+  auto* guid = guidByDeviceType(deviceType, isFloppy);
+
+  if (guid == nullptr) {
+    return 0;
+  }
+
+  HDEVINFO devInfo = SetupDiGetClassDevs(guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+  if (devInfo == INVALID_HANDLE_VALUE) {
+    return 0;
+  }
+
+  auto bufferSize = 1024;
+  auto buffer = std::make_unique<BYTE[]>(bufferSize);
+  SP_DEVICE_INTERFACE_DETAIL_DATA_A *detailData = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*)buffer.get();
+
+  DWORD index = 0;
+  SP_DEVICE_INTERFACE_DATA data{};
+  SP_DEVINFO_DATA infoData{};
+  data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+  for (DWORD index = 0; ; index++) {
+    if (!SetupDiEnumDeviceInterfaces(devInfo, nullptr, guid, index, &data)) {
+      break;
     }
-    if (k.ascii >= '0' && k.ascii <= '9') {
-      value *= 10;
-      value += k.ascii - '0';
-      std::cout << std::string(1, k.ascii);
-      if (value < 0) {
-        std::cout << "\n";
-        return -1;
+
+    DWORD size = 0;
+    SetupDiGetDeviceInterfaceDetail(devInfo, &data, nullptr, 0, &size, nullptr);
+
+    if (size != 0 && size <= bufferSize) {
+      detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+      std::memset(&infoData, 0, sizeof(SP_DEVINFO_DATA));
+      infoData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+      if (SetupDiGetDeviceInterfaceDetailA(devInfo, &data, detailData, size, &size, &infoData)) {
+        auto driveHandle = CreateFileA(detailData->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (driveHandle != INVALID_HANDLE_VALUE) {
+          STORAGE_DEVICE_NUMBER driveDevNum{};
+          if (DeviceIoControl(driveHandle, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &driveDevNum, sizeof(STORAGE_DEVICE_NUMBER), nullptr, nullptr)) {
+            if (driveDevNum.DeviceNumber == deviceNumber) {
+              CloseHandle(driveHandle);
+              SetupDiDestroyDeviceInfoList(devInfo);
+              return infoData.DevInst;
+            }
+          }
+          CloseHandle(driveHandle);
+        }
       }
     }
   }
+
+  SetupDiDestroyDeviceInfoList(devInfo);
+  return 0;
+}
+
+std::string getEjectionResultString(DWORD result, PNP_VETO_TYPE vetoType) {
+  if (result == 0x17) {
+    return localizeVeto(vetoType);
+  } else if (result == 0x33) {
+    return " Access denied\n";
+  } else {
+    return "Unexpected error : " + std::to_string(result);
+  }
+}
+
+void safeEject(const Notification& n) {
+  auto letter = n.letter;
+
+  auto devicePath = std::string(1, letter) + ":";
+  auto rootPath = devicePath + "\\";
+ 
+
+  STORAGE_DEVICE_NUMBER deviceNumber{};
+  if (!DeviceIoControl(n.volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &deviceNumber, sizeof(STORAGE_DEVICE_NUMBER), nullptr, nullptr)) {
+    std::cerr << "safeEject :: " << letter << " :: DeviceIoControl : " << GetLastError() << "\n";
+    std::cout << "Failed to safe eject device with volume " << letter << "\n";
+    return;
+  }
+
+  if (deviceNumber.DeviceNumber == -1) {
+    std::cerr << "Failed to safe eject volume " << letter << " because it have not device to be ejected\n";
+    return;
+  }
+
+  auto driveType = GetDriveTypeA(rootPath.c_str());
+  auto blob = std::make_unique<char[]>(MAX_PATH);
+  if (!QueryDosDeviceA(devicePath.c_str(), blob.get(), MAX_PATH)) {
+    std::cerr << "safeEject :: " << letter << " :: QueryDosDeviceA : " << GetLastError() << "\n";
+    std::cout << "Failed to safe eject device with volume " << letter << "\n";
+    return;
+  }
+  
+  std::string dosName(blob.get());
+  auto devInstance = getDeviceInstance(deviceNumber.DeviceNumber, driveType, dosName);
+
+  if (devInstance == 0) {
+    std::cout << "Failed to safe eject device with volume " << letter << " because cannot acquire device instance\n";
+    return;
+  }
+
+  blob = std::make_unique<char[]>(512);
+  PNP_VETO_TYPE vetoType{ };
+  auto result = CM_Query_And_Remove_SubTreeA(devInstance, &vetoType, nullptr, 0, 0);
+  if (result != CR_SUCCESS) {
+    std::cout << "Device safe ejection FAILED. " << getEjectionResultString(result, vetoType) << "\n";
+    return;
+  }
+
+  DEVINST parent{};
+  CM_Get_Parent(&parent, devInstance, 0);
+  result = CM_Request_Device_EjectA(parent, &vetoType, nullptr, 0, 0);
+  if (result != CR_SUCCESS) {
+    std::cout << "Device safe ejection FAILED. " << getEjectionResultString(result, vetoType) << "\n";
+    return;
+  }
+  std::cout << "Device safe ejection complete. Now you can safely disconnect your device from computer.\n";
 }
 
 DWORD __stdcall consoleThreadHandler(LPVOID param) {
@@ -275,6 +420,7 @@ DWORD __stdcall consoleThreadHandler(LPVOID param) {
   while (true) {
     auto key = readConsole(context.stdInput);
     if (key.scan == 0x01 && key.key == 0x1b) { // ESC
+      unregisterAllVolumeNotifications();
       SendMessage(context.window, WM_CLOSE, 0, 0);
       return 0;
     }
@@ -285,8 +431,10 @@ DWORD __stdcall consoleThreadHandler(LPVOID param) {
         std::cout << "[" << i << "]" << "Device with volume " << events[i].letter << ": \n";
       }
       int value = 0;
-      while ((value = readInt(context.stdInput)) < 0 || value >= events.size()) {
-        std::cout << "Error: OutOfBound\n";
+      if (int value = readInt(context.stdInput); value >= 0 && value < events.size()) {
+        safeEject(events[value]);
+      } else {
+        std::cout << "Error: value is not a number or doesn't satisfy required range\n";
       }
       allowMessageEvents = true;
     }
@@ -308,7 +456,7 @@ int main() {
   auto stdInput = GetStdHandle(STD_INPUT_HANDLE);
   DWORD mode{ 0 };
   GetConsoleMode(stdInput, &mode);
-  SetConsoleMode(stdInput, mode & ~ENABLE_ECHO_INPUT & ~ENABLE_QUICK_EDIT_MODE);
+  SetConsoleMode(stdInput, mode & ~ENABLE_QUICK_EDIT_MODE);
 
   const auto* windowClassName = L"WindowClass";
   WNDCLASS wc{ };
