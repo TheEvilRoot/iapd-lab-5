@@ -272,7 +272,7 @@ void initMessageHandlers() {
   });
 }
 
-long __stdcall windowHandler(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+LRESULT __stdcall windowHandler(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
   return messageHandlers[uMsg](hwnd, uMsg, wParam, lParam);
 }
 
@@ -397,11 +397,20 @@ void safeEject(const Notification& n) {
     return;
   }
 
+  for (const auto& c : events) {
+      STORAGE_DEVICE_NUMBER volumeDevNumber{};
+      if (DeviceIoControl(c.volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &volumeDevNumber, sizeof(STORAGE_DEVICE_NUMBER), nullptr, nullptr)) {
+          if (volumeDevNumber.DeviceNumber == deviceNumber.DeviceNumber) {
+              unregisterVolumeNotifications(c.letter);
+          }
+      }
+  }
+
   blob = std::make_unique<char[]>(512);
   PNP_VETO_TYPE vetoType{ };
   auto result = CM_Query_And_Remove_SubTreeA(devInstance, &vetoType, nullptr, 0, 0);
   if (result != CR_SUCCESS) {
-    std::cout << "Device safe ejection FAILED. " << getEjectionResultString(result, vetoType) << "\n";
+    std::cout << "Storage device safe ejection FAILED. " << getEjectionResultString(result, vetoType) << "\n";
     return;
   }
 
